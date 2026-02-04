@@ -1,0 +1,151 @@
+import rclpy
+from rclpy.node import Node
+from geometry_msgs.msg import Point
+import cv2
+import numpy as np
+from ultralytics import YOLO
+from openni import openni2
+import os
+
+# ==========================================
+# 1. 설정
+# ==========================================
+OPENNI_REDIST = "/home/hawon/Documents/depth_camera/Openni_Lib"
+MODEL_PATH    = "/home/hawon/Documents/depth_camera/cup_datav3/runs/detect/train/weights/best.pt"
+CAM_DEVICE    = "/dev/video2"
+
+CENTER_TOLERANCE = 15 
+WIDTH, HEIGHT = 640, 480
+IMG_SIZE = 640
+CONF_THRES = 0.75 
+MIN_Z_MM, MAX_Z_MM = 200, 3000
+ALPHA = 0.5
+FX, FY = 554.26, 554.26
+CX, CY = 320.0, 240.0
+
+def clamp(v, lo, hi):
+    return lo if v < lo else hi if v > hi else v
+
+def get_precise_center_depth(depth_mm, cx, cy):
+    h, w = depth_mm.shape[:2]
+    roi_size = 5
+    rx1 = clamp(cx - roi_size, 0, w); rx2 = clamp(cx + roi_size, 0, w)
+    ry1 = clamp(cy - roi_size, 0, h); ry2 = clamp(cy + roi_size, 0, h)
+    roi = depth_mm[ry1:ry2, rx1:rx2].astype(np.int32)
+    valid = roi[(roi >= MIN_Z_MM) & (roi <= MAX_Z_MM)]
+    if valid.size > 0: return float(np.median(valid))
+    return None
+
+class CameraNode(Node):
+    def __init__(self):
+        super().__init__('camera_node')
+        # 토픽 발행: 컵의 위치 정보 (x=오차, y=오차, z=거리)
+        self.publisher_ = self.create_publisher(Point, '/camera/tracking', 10)
+        
+        self.get_logger().info("📷 ROS 2 Camera Node Started!")
+        
+        # 장치 초기화
+        self.init_openni()
+        self.model = YOLO(MODEL_PATH)
+        self.cap = cv2.VideoCapture(CAM_DEVICE, cv2.CAP_V4L2)
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, WIDTH)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, HEIGHT)
+        self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+        
+        self.z_ema = None
+        self.timer = self.create_timer(0.03, self.run_loop) # 30FPS
+
+    def init_openni(self):
+        os.environ["OPENNI2_REDIST"] = OPENNI_REDIST
+        os.environ["OPENNI2_DRIVERS_PATH"] = os.path.join(OPENNI_REDIST, "Drivers")
+        try:
+            openni2.initialize(OPENNI_REDIST)
+            self.dev = openni2.Device.open_any()
+            try: self.dev.set_image_registration_mode(openni2.IMAGE_REGISTRATION_DEPTH_TO_COLOR)
+            except: pass
+            self.depth_stream = self.dev.create_depth_stream()
+            self.depth_stream.set_video_mode(openni2.VideoMode(pixelFormat=openni2.PIXEL_FORMAT_DEPTH_1_MM, resolutionX=WIDTH, resolutionY=HEIGHT, fps=30))
+            self.depth_stream.start()
+        except Exception as e:
+            self.get_logger().error(f"OpenNI Init Error: {e}")
+            exit()
+
+    def run_loop(self):
+        self.cap.grab()
+        ret, frame = self.cap.read()
+        if not ret: return
+        
+        dframe = self.depth_stream.read_frame()
+        depth_mm = np.frombuffer(dframe.get_buffer_as_uint16(), dtype=np.uint16).reshape((HEIGHT, WIDTH))
+        
+        vis = frame.copy()
+        SCREEN_CX, SCREEN_CY = WIDTH // 2, HEIGHT // 2
+        
+        # 조준 박스 그리기
+        cv2.rectangle(vis, (SCREEN_CX - CENTER_TOLERANCE, SCREEN_CY - CENTER_TOLERANCE), 
+                           (SCREEN_CX + CENTER_TOLERANCE, SCREEN_CY + CENTER_TOLERANCE), (0, 255, 255), 2)
+        cv2.line(vis, (SCREEN_CX, 0), (SCREEN_CX, HEIGHT), (100, 100, 100), 1)
+        cv2.line(vis, (0, SCREEN_CY), (WIDTH, SCREEN_CY), (100, 100, 100), 1)
+
+        results = self.model.predict(frame, imgsz=IMG_SIZE, conf=CONF_THRES, verbose=False)[0]
+
+        msg = Point()
+        msg.z = -1.0 # 기본값 (미감지)
+
+        if results.boxes:
+            target_box = max(results.boxes, key=lambda b: (b.xyxy[0][2]-b.xyxy[0][0]) * (b.xyxy[0][3]-b.xyxy[0][1]))
+            x1, y1, x2, y2 = map(int, target_box.xyxy[0])
+            obj_cx, obj_cy = (x1 + x2) // 2, (y1 + y2) // 2
+            
+            # 오차 계산 (화면 중앙 - 물체 중심)
+            # 이 값이 0이 되도록 J1을 돌려야 함
+            err_x = obj_cx - SCREEN_CX
+            
+            msg.x = float(err_x)
+            msg.y = float(obj_cy - SCREEN_CY)
+
+            is_perfect_center = (abs(err_x) <= CENTER_TOLERANCE) and (abs(msg.y) <= CENTER_TOLERANCE)
+
+            if is_perfect_center:
+                z_raw = get_precise_center_depth(depth_mm, SCREEN_CX, SCREEN_CY)
+                if z_raw:
+                    if self.z_ema is None: self.z_ema = z_raw
+                    else: self.z_ema = ALPHA * z_raw + (1.0 - ALPHA) * self.z_ema
+                    
+                    msg.z = float(self.z_ema) # 유효 거리값 담기
+                    
+                    cv2.circle(vis, (SCREEN_CX, SCREEN_CY), 8, (0, 255, 0), -1)
+                    cv2.putText(vis, "LOCKED", (SCREEN_CX + 20, SCREEN_CY), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+                    cv2.putText(vis, f"Z:{int(msg.z)}mm", (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+            else:
+                self.z_ema = None
+                cv2.arrowedLine(vis, (SCREEN_CX, SCREEN_CY), (obj_cx, obj_cy), (0, 0, 255), 2)
+                cv2.putText(vis, "ALIGNING...", (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+
+            cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 255, 0) if is_perfect_center else (0, 0, 255), 2)
+
+        else:
+            self.z_ema = None
+            msg.x = 0.0 # 타겟 없음
+            msg.y = 0.0
+            cv2.putText(vis, "NO TARGET", (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (100, 100, 100), 2)
+
+        # ROS 메시지 발행
+        self.publisher_.publish(msg)
+
+        cv2.imshow("Camera View", vis)
+        if cv2.waitKey(1) == ord('q'):
+            self.destroy_node()
+            rclpy.shutdown()
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = CameraNode()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt: pass
+    finally:
+        node.cap.release(); node.depth_stream.stop(); openni2.unload(); cv2.destroyAllWindows()
+
+if __name__ == '__main__':
+    main()
