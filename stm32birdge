@@ -1,0 +1,102 @@
+# stm32 <-> 우분투 연결
+
+import rclpy
+from rclpy.node import Node
+from std_msgs.msg import String
+import serial
+import time
+
+# ==========================================
+# 1. 설정 (포트 확인 필수!)
+# ==========================================
+PORT = '/dev/ttyACM0' # 또는 '/dev/ttyUSB0'
+BAUDRATE = 115200
+
+class STM32Bridge(Node):
+    def __init__(self):
+        super().__init__('stm32_bridge_node')
+        
+        # 시리얼 연결 시도
+        try:
+            self.ser = serial.Serial(PORT, BAUDRATE, timeout=0.1)
+            self.get_logger().info(f"✅ STM32 Connected on {PORT}")
+        except Exception as e:
+            self.get_logger().error(f"❌ Serial Error: {e}")
+            exit()
+
+        # ---------------------------------------------------------
+        # [토픽 구독 설정] 여기가 핵심입니다!
+        # 의미: "/stm32/joint" 라는 단톡방에 누가 글을 쓰면 
+        #       self.joint_callback 함수를 실행해라!
+        # ---------------------------------------------------------
+        self.subscription = self.create_subscription(
+            String,              # 메시지 타입 (문자열)
+            '/stm32/joint',      # 토픽 이름 (단톡방 이름)
+            self.joint_callback, # 메시지 오면 실행할 함수
+            10                   # 큐 사이즈
+        )
+        
+        self.home_subscription = self.create_subscription(
+            String,
+            '/stm32/home',
+            self.home_callback,
+            10
+        )
+
+        # 주기적으로 STM32 응답을 확인하기 위한 타이머 (0.01초마다 실행)
+        self.timer = self.create_timer(0.01, self.read_from_stm32)
+
+    # ---------------------------------------------------------
+    # 콜백 함수: ROS 2 명령 -> STM32 시리얼 전송
+    # ---------------------------------------------------------
+    def joint_callback(self, msg):
+        # 예: 터미널에서 "1 90.0" 이라고 보내면 msg.data에 들어옴
+        cmd = msg.data.strip()
+        
+        # STM32 프로토콜에 맞게 "J" 붙여주기
+        if not cmd.startswith('J'):
+            full_cmd = f"J{cmd}\r\n"
+        else:
+            full_cmd = f"{cmd}\r\n"
+            
+        self.ser.write(full_cmd.encode('utf-8'))
+        self.get_logger().info(f"📤 Send to STM32: {full_cmd.strip()}")
+
+    def home_callback(self, msg):
+        cmd = msg.data.strip()
+        if cmd == "ALL":
+            full_cmd = "HOME\r\n"
+        else:
+            full_cmd = f"HOME {cmd}\r\n"
+            
+        self.ser.write(full_cmd.encode('utf-8'))
+        self.get_logger().info(f"📤 Send Home: {full_cmd.strip()}")
+
+    # ---------------------------------------------------------
+    # STM32에서 오는 응답(DONE, BUSY) 읽기
+    # ---------------------------------------------------------
+    def read_from_stm32(self):
+        if self.ser.in_waiting > 0:
+            try:
+                line = self.ser.readline().decode('utf-8', errors='ignore').strip()
+                if line:
+                    # 화면에 출력 (ROS 2 로그 방식)
+                    self.get_logger().info(f"📩 STM32: {line}")
+            except:
+                pass
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = STM32Bridge()
+    
+    try:
+        rclpy.spin(node) # 프로그램이 안 꺼지고 계속 돎
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.ser.close()
+        node.destroy_node()
+        rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()
