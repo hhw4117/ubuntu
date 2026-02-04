@@ -1,0 +1,142 @@
+import rclpy
+from rclpy.node import Node
+from geometry_msgs.msg import Point
+from std_msgs.msg import String
+import math
+
+class VisualServo(Node):
+    def __init__(self):
+        super().__init__('visual_servo_node')
+
+        # 입력: 카메라 트래킹 (msg.x=err_x(px), msg.z=depth(mm or -1))
+        self.subscription = self.create_subscription(
+            Point,
+            '/camera/tracking',
+            self.camera_callback,
+            10
+        )
+
+        # 출력: STM32 명령 ("1 45.50" 형식)
+        self.publisher_ = self.create_publisher(String, '/stm32/joint', 10)
+
+        # 상태
+        self.current_j1_angle = 0.0
+
+        # ===== 튜닝 파라미터 =====
+        self.kp = 0.008              # err_x(px) -> delta_angle(deg) 비례계수 (방향은 +로 맞춘 상태)
+        self.DEADBAND_PX = 10        # 이 픽셀 이내면 정렬로 보고 움직이지 않음
+        self.MAX_STEP_DEG = 0.3      # 프레임(콜백)당 최대 회전량 제한(오버슈트 방지)
+        self.J1_MIN_DEG = -90.0
+        self.J1_MAX_DEG = 90.0
+
+        # err_x EMA(노이즈 완화)
+        self.alpha = 0.3             # 0.2~0.5
+        self.err_ema = 0.0
+        self.ema_inited = False
+
+        # 타겟 로스트 처리
+        self.last_seen_time = self.get_clock().now()
+        self.LOST_TIMEOUT_SEC = 0.25  # 이 시간 이상 타겟이 없으면 "탐색" 모드
+        self.search_dir = 1.0
+        self.SEARCH_STEP_DEG = 0.25   # 탐색 시 한 번에 움직이는 각도
+        self.SEARCH_HZ_LIMIT = 20.0   # 탐색 중 너무 빠르게 publish하지 않도록
+        self.last_pub_time = self.get_clock().now()
+
+        # depth를 거리값으로만 쓰고, "LOCKED" 판단은 err_x로만 합니다.
+        # (depth > 0이면 return 같은 동작 제거)
+
+    @staticmethod
+    def clamp(v, lo, hi):
+        return lo if v < lo else hi if v > hi else v
+
+    def publish_j1(self):
+        cmd_str = f"1 {self.current_j1_angle:.2f}"
+        msg_out = String()
+        msg_out.data = cmd_str
+        self.publisher_.publish(msg_out)
+        return cmd_str
+
+    def do_search(self, now):
+        # 탐색 publish 주파수 제한
+        dt = (now - self.last_pub_time).nanoseconds * 1e-9
+        if dt < (1.0 / self.SEARCH_HZ_LIMIT):
+            return
+
+        self.current_j1_angle += self.search_dir * self.SEARCH_STEP_DEG
+
+        # 끝에 닿으면 방향 반전
+        if self.current_j1_angle >= self.J1_MAX_DEG:
+            self.current_j1_angle = self.J1_MAX_DEG
+            self.search_dir *= -1.0
+        elif self.current_j1_angle <= self.J1_MIN_DEG:
+            self.current_j1_angle = self.J1_MIN_DEG
+            self.search_dir *= -1.0
+
+        cmd_str = self.publish_j1()
+        self.last_pub_time = now
+        self.get_logger().info(f"🛰️ SEARCHING... {cmd_str}")
+
+    def camera_callback(self, msg: Point):
+        now = self.get_clock().now()
+
+        err_x = float(msg.x)
+        depth = float(msg.z)
+
+        # ===== 타겟 존재 판정 =====
+        # 사용 중인 트래킹 코드가 "없음"을 (err_x=0, depth=-1)로 보내는 케이스 대응
+        target_visible = not (depth == -1.0 and err_x == 0.0)
+
+        if not target_visible:
+            # 마지막으로 타겟을 본 시점 기준으로 일정시간 지나면 탐색
+            dt_lost = (now - self.last_seen_time).nanoseconds * 1e-9
+            if dt_lost >= self.LOST_TIMEOUT_SEC:
+                self.do_search(now)
+            return
+
+        # 타겟 보임 업데이트
+        self.last_seen_time = now
+
+        # ===== 노이즈 완화(EMA) =====
+        if not self.ema_inited:
+            self.err_ema = err_x
+            self.ema_inited = True
+        else:
+            self.err_ema = self.alpha * err_x + (1.0 - self.alpha) * self.err_ema
+
+        use_err = self.err_ema
+
+        # ===== 정렬(LOCK) 판단은 err_x 기반 =====
+        if abs(use_err) <= self.DEADBAND_PX:
+            # 필요하면 거리 로그만 찍기(제어는 멈춤)
+            if depth > 0:
+                self.get_logger().info(f"✅ LOCKED (err_x≈0). Distance: {depth:.0f}mm")
+            return
+
+        # ===== P 제어(방향 이미 맞춘 상태) =====
+        delta_angle = use_err * self.kp
+
+        # 프레임당 변화량 제한(오버슈트 방지)
+        delta_angle = self.clamp(delta_angle, -self.MAX_STEP_DEG, self.MAX_STEP_DEG)
+
+        # 각도 누적 업데이트 + 범위 제한
+        self.current_j1_angle += delta_angle
+        self.current_j1_angle = self.clamp(self.current_j1_angle, self.J1_MIN_DEG, self.J1_MAX_DEG)
+
+        cmd_str = self.publish_j1()
+        self.get_logger().info(
+            f"🔄 Adjusting J1: {cmd_str} (err_x={err_x:.1f}, ema={use_err:.1f}, d={depth:.0f})"
+        )
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = VisualServo()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()
