@@ -1,100 +1,156 @@
-# stm32 <-> 우분투 연결
+import os
+os.environ["QT_QPA_PLATFORM"] = "xcb"
 
+import traceback  # ★ 추가
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import String
-import serial
-import time
+from geometry_msgs.msg import Point
+import cv2
+import numpy as np
+from ultralytics import YOLO
+from openni import openni2
 
-# ==========================================
-# 1. 설정 (포트 확인 필수!)
-# ==========================================
-PORT = '/dev/ttyACM0' # 또는 '/dev/ttyUSB0'
-BAUDRATE = 115200
+# ================= 설정 =================
+OPENNI_REDIST = "/home/hawon/Documents/depth_camera/Openni_Lib"
+MODEL_PATH    = "/home/hawon/Documents/depth_camera/cup_datav3/runs/detect/train/weights/best.pt"
+CAM_DEVICE    = "/dev/video2"
 
-class STM32Bridge(Node):
+CENTER_TOLERANCE = 15
+WIDTH, HEIGHT = 640, 480
+IMG_SIZE = 640
+CONF_THRES = 0.75
+MIN_Z_MM, MAX_Z_MM = 200, 3000
+ALPHA = 0.5
+CX, CY = 320.0, 240.0
+# ========================================
+
+def clamp(v, lo, hi): return lo if v < lo else hi if v > hi else v
+
+def get_precise_center_depth(depth_mm, cx, cy):
+    h, w = depth_mm.shape[:2]
+    roi_size = 5
+    rx1 = clamp(cx - roi_size, 0, w); rx2 = clamp(cx + roi_size, 0, w)
+    ry1 = clamp(cy - roi_size, 0, h); ry2 = clamp(cy + roi_size, 0, h)
+    roi = depth_mm[ry1:ry2, rx1:rx2].astype(np.int32)
+    valid = roi[(roi >= MIN_Z_MM) & (roi <= MAX_Z_MM)]
+    if valid.size > 0: return float(np.median(valid))
+    return None
+
+class CameraNode(Node):
     def __init__(self):
-        super().__init__('stm32_bridge_node')
-        
-        # 시리얼 연결 시도
+        super().__init__('camera_node')
+        self.publisher_ = self.create_publisher(Point, '/camera/tracking', 10)
+        self.get_logger().info("📷 ROS 2 Camera Node Started!")
+
+        # ---- 단계 로그(어디서 죽는지 확인) ----
+        self.get_logger().info("STEP1: init_openni()")
+        self.init_openni()
+        self.get_logger().info("STEP2: YOLO load")
+        self.model = YOLO(MODEL_PATH)
+        self.get_logger().info("STEP3: VideoCapture open")
+        self.cap = cv2.VideoCapture(CAM_DEVICE, cv2.CAP_V4L2)
+        self.get_logger().info(f"STEP3-1: cap.isOpened() = {self.cap.isOpened()}")
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, WIDTH)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, HEIGHT)
+        self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+
+        self.z_ema = None
+        self.timer = self.create_timer(0.03, self.run_loop)
+        self.get_logger().info("STEP4: timer started")
+
+    def init_openni(self):
+        os.environ["OPENNI2_REDIST"] = OPENNI_REDIST
+        os.environ["OPENNI2_DRIVERS_PATH"] = os.path.join(OPENNI_REDIST, "Drivers")
         try:
-            self.ser = serial.Serial(PORT, BAUDRATE, timeout=0.1)
-            self.get_logger().info(f"✅ STM32 Connected on {PORT}")
-        except Exception as e:
-            self.get_logger().error(f"❌ Serial Error: {e}")
-            exit()
-
-        # ---------------------------------------------------------
-        # [토픽 구독 설정] 여기가 핵심입니다!
-        # 의미: "/stm32/joint" 라는 단톡방에 누가 글을 쓰면 
-        #       self.joint_callback 함수를 실행해라!
-        # ---------------------------------------------------------
-        self.subscription = self.create_subscription(
-            String,              # 메시지 타입 (문자열)
-            '/stm32/joint',      # 토픽 이름 (단톡방 이름)
-            self.joint_callback, # 메시지 오면 실행할 함수
-            10                   # 큐 사이즈
-        )
-        
-        self.home_subscription = self.create_subscription(
-            String,
-            '/stm32/home',
-            self.home_callback,
-            10
-        )
-
-        # 주기적으로 STM32 응답을 확인하기 위한 타이머 (0.01초마다 실행)
-        self.timer = self.create_timer(0.01, self.read_from_stm32)
-
-    # ---------------------------------------------------------
-    # 콜백 함수: ROS 2 명령 -> STM32 시리얼 전송
-    # ---------------------------------------------------------
-    def joint_callback(self, msg):
-        # 예: 터미널에서 "1 90.0" 이라고 보내면 msg.data에 들어옴
-        cmd = msg.data.strip()
-        
-        # STM32 프로토콜에 맞게 "J" 붙여주기
-        if not cmd.startswith('J'):
-            full_cmd = f"J{cmd}\r\n"
-        else:
-            full_cmd = f"{cmd}\r\n"
-            
-        self.ser.write(full_cmd.encode('utf-8'))
-        self.get_logger().info(f"📤 Send to STM32: {full_cmd.strip()}")
-
-    def home_callback(self, msg):
-        cmd = msg.data.strip()
-        if cmd == "ALL":
-            full_cmd = "HOME\r\n"
-        else:
-            full_cmd = f"HOME {cmd}\r\n"
-            
-        self.ser.write(full_cmd.encode('utf-8'))
-        self.get_logger().info(f"📤 Send Home: {full_cmd.strip()}")
-
-    # ---------------------------------------------------------
-    # STM32에서 오는 응답(DONE, BUSY) 읽기
-    # ---------------------------------------------------------
-    def read_from_stm32(self):
-        if self.ser.in_waiting > 0:
+            openni2.initialize(OPENNI_REDIST)
+            self.dev = openni2.Device.open_any()
             try:
-                line = self.ser.readline().decode('utf-8', errors='ignore').strip()
-                if line:
-                    # 화면에 출력 (ROS 2 로그 방식)
-                    self.get_logger().info(f"📩 STM32: {line}")
-            except:
+                self.dev.set_image_registration_mode(openni2.IMAGE_REGISTRATION_DEPTH_TO_COLOR)
+            except Exception:
                 pass
+            self.depth_stream = self.dev.create_depth_stream()
+            self.depth_stream.set_video_mode(
+                openni2.VideoMode(
+                    pixelFormat=openni2.PIXEL_FORMAT_DEPTH_1_MM,
+                    resolutionX=WIDTH,
+                    resolutionY=HEIGHT,
+                    fps=30
+                )
+            )
+            self.depth_stream.start()
+        except Exception as e:
+            self.get_logger().error(f"OPENNI init failed: {e}")
+            self.get_logger().error(traceback.format_exc())
+            raise  # ★ 여기서 죽더라도 “왜 죽었는지” 로그가 남습니다.
+
+    def run_loop(self):
+        self.cap.grab()
+        ret, frame = self.cap.read()
+        if not ret:
+            return
+
+        dframe = self.depth_stream.read_frame()
+        depth_mm = np.frombuffer(dframe.get_buffer_as_uint16(), dtype=np.uint16).reshape((HEIGHT, WIDTH))
+
+        vis = frame.copy()
+        SCREEN_CX, SCREEN_CY = WIDTH // 2, HEIGHT // 2
+
+        cv2.rectangle(vis, (SCREEN_CX - CENTER_TOLERANCE, SCREEN_CY - CENTER_TOLERANCE),
+                           (SCREEN_CX + CENTER_TOLERANCE, SCREEN_CY + CENTER_TOLERANCE), (0, 255, 255), 2)
+
+        results = self.model.predict(frame, imgsz=IMG_SIZE, conf=CONF_THRES, verbose=False)[0]
+        msg = Point()
+        msg.z = -1.0
+
+        if results.boxes:
+            target_box = max(results.boxes, key=lambda b: (b.xyxy[0][2]-b.xyxy[0][0]) * (b.xyxy[0][3]-b.xyxy[0][1]))
+            x1, y1, x2, y2 = map(int, target_box.xyxy[0])
+            obj_cx = (x1 + x2) // 2
+            err_x = obj_cx - SCREEN_CX
+            msg.x = float(err_x)
+
+            is_perfect_center = (abs(err_x) <= CENTER_TOLERANCE)
+            if is_perfect_center:
+                z_raw = get_precise_center_depth(depth_mm, SCREEN_CX, SCREEN_CY)
+                if z_raw:
+                    self.z_ema = z_raw if self.z_ema is None else (ALPHA * z_raw + (1.0 - ALPHA) * self.z_ema)
+                    msg.z = float(self.z_ema)
+                    cv2.putText(vis, "LOCKED", (SCREEN_CX + 20, SCREEN_CY),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+            else:
+                self.z_ema = None
+
+            cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 255, 0) if is_perfect_center else (0, 0, 255), 2)
+        else:
+            msg.x = 0.0
+            msg.z = -1.0
+
+        self.publisher_.publish(msg)
+        cv2.imshow("ROS2 Camera", vis)
+        if cv2.waitKey(1) == ord('q'):
+            self.destroy_node()
+            rclpy.shutdown()
+def destroy_node(self):
+    try:
+        if hasattr(self, "depth_stream"):
+            self.depth_stream.stop()
+        if hasattr(self, "dev"):
+            pass
+        if hasattr(self, "cap") and self.cap:
+            self.cap.release()
+        cv2.destroyAllWindows()
+    except:
+        pass
+    super().destroy_node()
 
 def main(args=None):
     rclpy.init(args=args)
-    node = STM32Bridge()
-    
+    node = CameraNode()
     try:
-        rclpy.spin(node) # 프로그램이 안 꺼지고 계속 돎
+        rclpy.spin(node)
     except KeyboardInterrupt:
         pass
     finally:
-        node.ser.close()
         node.destroy_node()
         rclpy.shutdown()
 
