@@ -5,38 +5,39 @@ from std_msgs.msg import String
 from rclpy.qos import qos_profile_sensor_data
 import time
 
-print("✅ [시스템] Visual Servo (고속 비례 제어 - 드리프트 제거) 가동...")
+print("✅ [시스템] Visual Servo (진짜 정밀 모드: 마찰력 보상) 가동...")
 
 class VisualServo(Node):
     def __init__(self):
         super().__init__('visual_servo_node')
-
         self.subscription = self.create_subscription(
             Point, '/camera/tracking', self.camera_callback, qos_profile_sensor_data
         )
         self.publisher_ = self.create_publisher(String, '/stm32/joint', 10)
-
+        
         self.current_j1_angle = 0.0
         self.J1_MIN_DEG = -90.0
         self.J1_MAX_DEG = 90.0
 
-        # ===== 기존 튜닝 파라미터 유지 =====
-        self.DEADBAND_PX = 10.0
+        # ===== 파라미터 튜닝 =====
+        # 목표는 4px 이내 (아주 엄격함)
+        self.DEADBAND_PX = 4.0
+        
+        # 반응성 향상
+        self.alpha = 0.85
+        
         self.BASE_SPEED = 1000
         self.CMD_INTERVAL = 0.04
-        self.k_step = 0.005  # (이 값은 이제 "deg/px 스케일"로 사용)
+        self.k_step = 0.005
+        # =======================
 
-        self.alpha = 0.6
         self.err_ema = 0.0
         self.ema_inited = False
-
         self.last_pub_time = 0.0
         self.state = 'IDLE'
         self.last_dist_print_time = 0.0
-
-        # ✅ 드리프트 제거용: "기준 각도"(LOCKED에서 갱신)
         self.base_angle = 0.0
-
+        
         print("✅ 초기화 완료. 컵을 보여주세요!")
 
     def publish(self, s: str):
@@ -55,72 +56,62 @@ class VisualServo(Node):
         err_x = float(msg.x)
         depth = float(msg.z)
 
-        # 타겟 없음
+        # 타겟 놓침 방지
         if depth == -1.0 and err_x == 0.0:
             if self.state != 'IDLE':
-                print("⚠️ 타겟 놓침")
-                self.state = 'IDLE'
+                if (now - self.last_pub_time) > 0.5:
+                     print("⚠️ 타겟 놓침")
+                     self.state = 'IDLE'
             return
 
-        # EMA (노이즈 제거)
+        # EMA 필터
         if not self.ema_inited:
             self.err_ema = err_x
             self.ema_inited = True
         else:
             self.err_ema = self.alpha * err_x + (1.0 - self.alpha) * self.err_ema
+
         e = self.err_ema
 
-        # 1) 정렬 완료
+        # 1) 정렬 완료 판단 (4.0px 이내)
         if abs(e) <= self.DEADBAND_PX:
             if self.state != 'LOCKED':
                 self.publish("STOP")
                 dist_str = f"{depth:.0f}mm" if depth > 0 else "거리측정불가"
-                print(f"🛑 정렬 완료! [거리: {dist_str}] (Err: {e:.1f})")
-
-                # ✅ LOCKED 순간의 목표각을 기준각으로 고정 (누적 드리프트 방지)
+                # 성공했을 때만 로그 출력
+                print(f"🎯 정밀 주차 성공! [LOCKED] (Err: {e:.1f}px)")
+                
                 self.base_angle = self.current_j1_angle
-
                 self.state = 'LOCKED'
                 self.last_dist_print_time = now
-
             elif (now - self.last_dist_print_time) > 1.0:
                 dist_str = f"{depth:.0f}mm" if depth > 0 else "거리측정불가"
                 print(f"📏 현재 거리: {dist_str}")
                 self.last_dist_print_time = now
-
+            
             self.last_pub_time = now
             return
 
         self.state = 'MOVING'
 
-        # ============================================================
-        # ✅ 핵심 변경: current_j1_angle을 +=로 누적하지 않음
-        # 목표각을 "기준각 + 오차비례"로 직접 계산
-        # ============================================================
-
-        # 픽셀 오차 -> 각도 오차로 변환 (deg/px)
-        # 기존 k_step을 그대로 재사용(0.005면 100px -> 0.5도)
+        # 2) 이동 로직
         angle_offset = e * self.k_step
-
-        # 목표각 = 기준각 + 오프셋
         target_angle = self.base_angle + angle_offset
-
-        # 목표각 제한
         target_angle = self.clamp(target_angle, self.J1_MIN_DEG, self.J1_MAX_DEG)
-
-        # 내부 상태도 "목표각"으로 동기화(다음 LOCKED 때 base_angle 갱신을 위해)
         self.current_j1_angle = target_angle
 
-        # 속도는 기존 로직 유지
+        # 3) ★ 핵심 수정: 속도 제어 (마찰력 극복) ★
+        # 오차가 작아도(가까워져도) 힘을 너무 빼지 않습니다.
+        # 기존: 가까우면 200~300 -> 모터가 '웅~' 하고 안 움직임
+        # 수정: 가까워도 최소 750의 힘으로 밀어붙임
+        
         dynamic_speed = int(self.BASE_SPEED + (1000 / (abs(e) + 1)) * 5)
-        if dynamic_speed > 2500:
-            dynamic_speed = 2500
-        if dynamic_speed < 500:
-            dynamic_speed = 500
+        
+        # 최소 속도를 750으로 높여서 "마지막 13px"을 밀고 갈 힘을 줍니다.
+        dynamic_speed = self.clamp(dynamic_speed, 750, 2500)
 
         cmd_str = f"T1 {target_angle:.3f} {dynamic_speed}"
         self.publish(cmd_str)
-
         self.last_pub_time = now
 
 def main(args=None):
