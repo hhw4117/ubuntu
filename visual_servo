@@ -5,7 +5,7 @@ from std_msgs.msg import String
 from rclpy.qos import qos_profile_sensor_data
 import time
 
-print("✅ [시스템] Visual Servo (거리 측정 + 스마트 추적) 가동...")
+print("✅ [시스템] Visual Servo (고속 비례 제어 - 드리프트 제거) 가동...")
 
 class VisualServo(Node):
     def __init__(self):
@@ -16,24 +16,15 @@ class VisualServo(Node):
         )
         self.publisher_ = self.create_publisher(String, '/stm32/joint', 10)
 
-        self.current_j1_angle = 0.0   
+        self.current_j1_angle = 0.0
         self.J1_MIN_DEG = -90.0
         self.J1_MAX_DEG = 90.0
 
-        # ===== 튜닝 파라미터 =====
-        self.DEADBAND_PX = 10         # [수정] 20 -> 10 (더 정밀하게 멈춤)
-
-        # 속도/보폭 설정
-        self.SPD_FAST   = 800         
-        self.SPD_MID    = 1500        
-        self.SPD_SLOW   = 2500        
-
-        self.STEP_BIG   = 0.5         
-        self.STEP_MID   = 0.2         
-        self.STEP_TINY  = 0.05        
-
-        self.CMD_INTERVAL = 0.04      
-        self.k_step = 0.003           
+        # ===== 기존 튜닝 파라미터 유지 =====
+        self.DEADBAND_PX = 10.0
+        self.BASE_SPEED = 1000
+        self.CMD_INTERVAL = 0.04
+        self.k_step = 0.005  # (이 값은 이제 "deg/px 스케일"로 사용)
 
         self.alpha = 0.6
         self.err_ema = 0.0
@@ -41,7 +32,10 @@ class VisualServo(Node):
 
         self.last_pub_time = 0.0
         self.state = 'IDLE'
-        self.last_dist_print_time = 0.0 # 거리 출력용 타이머
+        self.last_dist_print_time = 0.0
+
+        # ✅ 드리프트 제거용: "기준 각도"(LOCKED에서 갱신)
+        self.base_angle = 0.0
 
         print("✅ 초기화 완료. 컵을 보여주세요!")
 
@@ -53,28 +47,22 @@ class VisualServo(Node):
     def clamp(self, v, lo, hi):
         return lo if v < lo else hi if v > hi else v
 
-    def get_adaptive_params(self, error_px):
-        abs_e = abs(error_px)
-        if abs_e > 150: return self.SPD_FAST, self.STEP_BIG
-        elif abs_e > 60: return self.SPD_MID, self.STEP_MID
-        else: return self.SPD_SLOW, self.STEP_TINY
-
     def camera_callback(self, msg: Point):
         now = time.time()
         if (now - self.last_pub_time) < self.CMD_INTERVAL:
             return
 
         err_x = float(msg.x)
-        depth = float(msg.z) # 카메라에서 오는 거리값 (단위 확인 필요, 보통 mm)
+        depth = float(msg.z)
 
         # 타겟 없음
         if depth == -1.0 and err_x == 0.0:
             if self.state != 'IDLE':
-                print("⚠️ 타겟 놓침 (대기)")
+                print("⚠️ 타겟 놓침")
                 self.state = 'IDLE'
             return
 
-        # EMA 필터
+        # EMA (노이즈 제거)
         if not self.ema_inited:
             self.err_ema = err_x
             self.ema_inited = True
@@ -82,23 +70,19 @@ class VisualServo(Node):
             self.err_ema = self.alpha * err_x + (1.0 - self.alpha) * self.err_ema
         e = self.err_ema
 
-        # ============================================================
-        # [핵심] 정렬 완료 (LOCKED) 시 거리 출력
-        # ============================================================
+        # 1) 정렬 완료
         if abs(e) <= self.DEADBAND_PX:
-            
-            # 1. 막 도착했을 때 (MOVING -> LOCKED)
             if self.state != 'LOCKED':
                 self.publish("STOP")
-                
-                # 거리 정보 예쁘게 만들기
                 dist_str = f"{depth:.0f}mm" if depth > 0 else "거리측정불가"
                 print(f"🛑 정렬 완료! [거리: {dist_str}] (Err: {e:.1f})")
-                
+
+                # ✅ LOCKED 순간의 목표각을 기준각으로 고정 (누적 드리프트 방지)
+                self.base_angle = self.current_j1_angle
+
                 self.state = 'LOCKED'
                 self.last_dist_print_time = now
-            
-            # 2. 멈춰있는 동안에도 거리가 바뀌면 계속 보여줄까? (1초마다 갱신)
+
             elif (now - self.last_dist_print_time) > 1.0:
                 dist_str = f"{depth:.0f}mm" if depth > 0 else "거리측정불가"
                 print(f"📏 현재 거리: {dist_str}")
@@ -107,26 +91,36 @@ class VisualServo(Node):
             self.last_pub_time = now
             return
 
-        # ============================================================
-
-        # 재추격
-        if self.state == 'LOCKED':
-            print(f"🏃 움직임 감지! 재추격 (Err: {e:.1f})")
         self.state = 'MOVING'
 
-        direction = 1.0 if e > 0 else -1.0 
-        cur_spd, cur_step_limit = self.get_adaptive_params(e)
+        # ============================================================
+        # ✅ 핵심 변경: current_j1_angle을 +=로 누적하지 않음
+        # 목표각을 "기준각 + 오차비례"로 직접 계산
+        # ============================================================
 
-        raw_step = abs(e) * self.k_step
-        final_step = self.clamp(raw_step, 0.02, cur_step_limit)
-        delta_deg = direction * final_step
+        # 픽셀 오차 -> 각도 오차로 변환 (deg/px)
+        # 기존 k_step을 그대로 재사용(0.005면 100px -> 0.5도)
+        angle_offset = e * self.k_step
 
-        self.current_j1_angle += delta_deg
-        self.current_j1_angle = self.clamp(self.current_j1_angle, self.J1_MIN_DEG, self.J1_MAX_DEG)
+        # 목표각 = 기준각 + 오프셋
+        target_angle = self.base_angle + angle_offset
 
-        cmd_str = f"T1 {self.current_j1_angle:.3f} {cur_spd}"
+        # 목표각 제한
+        target_angle = self.clamp(target_angle, self.J1_MIN_DEG, self.J1_MAX_DEG)
+
+        # 내부 상태도 "목표각"으로 동기화(다음 LOCKED 때 base_angle 갱신을 위해)
+        self.current_j1_angle = target_angle
+
+        # 속도는 기존 로직 유지
+        dynamic_speed = int(self.BASE_SPEED + (1000 / (abs(e) + 1)) * 5)
+        if dynamic_speed > 2500:
+            dynamic_speed = 2500
+        if dynamic_speed < 500:
+            dynamic_speed = 500
+
+        cmd_str = f"T1 {target_angle:.3f} {dynamic_speed}"
         self.publish(cmd_str)
-        
+
         self.last_pub_time = now
 
 def main(args=None):
