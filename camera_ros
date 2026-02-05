@@ -1,7 +1,6 @@
 import os
 os.environ["QT_QPA_PLATFORM"] = "xcb"
-
-import traceback  # ★ 추가
+import traceback
 import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Point
@@ -15,7 +14,9 @@ OPENNI_REDIST = "/home/hawon/Documents/depth_camera/Openni_Lib"
 MODEL_PATH    = "/home/hawon/Documents/depth_camera/cup_datav3/runs/detect/train/weights/best.pt"
 CAM_DEVICE    = "/dev/video2"
 
-CENTER_TOLERANCE = 15
+# ★ 다시 정직하게 15px로 복구! (기계가 실제로 맞추도록 강제함)
+CENTER_TOLERANCE = 15 
+
 WIDTH, HEIGHT = 640, 480
 IMG_SIZE = 640
 CONF_THRES = 0.75
@@ -41,22 +42,17 @@ class CameraNode(Node):
         super().__init__('camera_node')
         self.publisher_ = self.create_publisher(Point, '/camera/tracking', 10)
         self.get_logger().info("📷 ROS 2 Camera Node Started!")
-
-        # ---- 단계 로그(어디서 죽는지 확인) ----
-        self.get_logger().info("STEP1: init_openni()")
+        
         self.init_openni()
-        self.get_logger().info("STEP2: YOLO load")
         self.model = YOLO(MODEL_PATH)
-        self.get_logger().info("STEP3: VideoCapture open")
         self.cap = cv2.VideoCapture(CAM_DEVICE, cv2.CAP_V4L2)
-        self.get_logger().info(f"STEP3-1: cap.isOpened() = {self.cap.isOpened()}")
+        
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, WIDTH)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, HEIGHT)
         self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-
+        
         self.z_ema = None
         self.timer = self.create_timer(0.03, self.run_loop)
-        self.get_logger().info("STEP4: timer started")
 
     def init_openni(self):
         os.environ["OPENNI2_REDIST"] = OPENNI_REDIST
@@ -81,7 +77,7 @@ class CameraNode(Node):
         except Exception as e:
             self.get_logger().error(f"OPENNI init failed: {e}")
             self.get_logger().error(traceback.format_exc())
-            raise  # ★ 여기서 죽더라도 “왜 죽었는지” 로그가 남습니다.
+            raise
 
     def run_loop(self):
         self.cap.grab()
@@ -91,57 +87,69 @@ class CameraNode(Node):
 
         dframe = self.depth_stream.read_frame()
         depth_mm = np.frombuffer(dframe.get_buffer_as_uint16(), dtype=np.uint16).reshape((HEIGHT, WIDTH))
-
+        
         vis = frame.copy()
         SCREEN_CX, SCREEN_CY = WIDTH // 2, HEIGHT // 2
-
+        
         cv2.rectangle(vis, (SCREEN_CX - CENTER_TOLERANCE, SCREEN_CY - CENTER_TOLERANCE),
                            (SCREEN_CX + CENTER_TOLERANCE, SCREEN_CY + CENTER_TOLERANCE), (0, 255, 255), 2)
 
         results = self.model.predict(frame, imgsz=IMG_SIZE, conf=CONF_THRES, verbose=False)[0]
+        
         msg = Point()
         msg.z = -1.0
 
         if results.boxes:
             target_box = max(results.boxes, key=lambda b: (b.xyxy[0][2]-b.xyxy[0][0]) * (b.xyxy[0][3]-b.xyxy[0][1]))
             x1, y1, x2, y2 = map(int, target_box.xyxy[0])
+            
             obj_cx = (x1 + x2) // 2
             err_x = obj_cx - SCREEN_CX
+            
             msg.x = float(err_x)
-
+            
+            # 다시 엄격하게 15px 체크
             is_perfect_center = (abs(err_x) <= CENTER_TOLERANCE)
+            
+            info_text = f"Err: {err_x}"
+            
             if is_perfect_center:
                 z_raw = get_precise_center_depth(depth_mm, SCREEN_CX, SCREEN_CY)
                 if z_raw:
                     self.z_ema = z_raw if self.z_ema is None else (ALPHA * z_raw + (1.0 - ALPHA) * self.z_ema)
                     msg.z = float(self.z_ema)
-                    cv2.putText(vis, "LOCKED", (SCREEN_CX + 20, SCREEN_CY),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+                    info_text += " [LOCKED]"
             else:
                 self.z_ema = None
+            
+            color = (0, 255, 0) if is_perfect_center else (0, 0, 255)
+            cv2.rectangle(vis, (x1, y1), (x2, y2), color, 2)
+            cv2.putText(vis, info_text, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
 
-            cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 255, 0) if is_perfect_center else (0, 0, 255), 2)
         else:
             msg.x = 0.0
             msg.z = -1.0
+            cv2.putText(vis, "NO TARGET", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0,0,255), 2)
 
         self.publisher_.publish(msg)
         cv2.imshow("ROS2 Camera", vis)
+        
         if cv2.waitKey(1) == ord('q'):
             self.destroy_node()
             rclpy.shutdown()
-def destroy_node(self):
-    try:
-        if hasattr(self, "depth_stream"):
-            self.depth_stream.stop()
-        if hasattr(self, "dev"):
+
+    def destroy_node(self):
+        try:
+            if hasattr(self, "depth_stream"):
+                self.depth_stream.stop()
+            if hasattr(self, "dev"):
+                pass
+            if hasattr(self, "cap") and self.cap:
+                self.cap.release()
+            cv2.destroyAllWindows()
+        except:
             pass
-        if hasattr(self, "cap") and self.cap:
-            self.cap.release()
-        cv2.destroyAllWindows()
-    except:
-        pass
-    super().destroy_node()
+        super().destroy_node()
 
 def main(args=None):
     rclpy.init(args=args)
